@@ -1,28 +1,63 @@
-// routes.js (Render API) — mirrors your working Apify logic, no login checks
 import { createPlaywrightRouter, Dataset } from 'crawlee';
+import fs from 'node:fs';
+import path from 'node:path';
 
 export const router = createPlaywrightRouter();
 
-// We keep your "search" entry like in Apify (label set from main/start code)
+function ensureDir(dir) {
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+}
+
+async function clickFirstVisible(page, selectorList, log, timeoutPerSel = 8000) {
+  for (const sel of selectorList) {
+    const loc = page.locator(sel).first();
+    const count = await loc.count().catch(() => 0);
+    if (!count) continue;
+    try {
+      await loc.waitFor({ timeout: timeoutPerSel });
+      if (await loc.isVisible().catch(() => false)) {
+        log.info(`👉 Clicking selector: ${sel}`);
+        await loc.click({ timeout: timeoutPerSel }).catch(() => {});
+        return true;
+      }
+    } catch {}
+  }
+  return false;
+}
+
+async function waitForAny(page, selectors, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    for (const sel of selectors) {
+      const loc = page.locator(sel);
+      if ((await loc.count().catch(() => 0)) > 0) return sel;
+    }
+    await page.waitForTimeout(400);
+  }
+  return null;
+}
+
 router.addHandler('search', async ({ request, page, log }) => {
   const { company } = request.userData;
   log.info(`Processing company: ${company}`, { url: request.url });
 
-  // Load homepage
+  const shotsDir = path.join(process.cwd(), 'screenshots');
+  ensureDir(shotsDir);
+
+  // 1) Load & settle
   await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
 
-  // Cookie consent (same intent as your Apify code)
-  try {
-    const cookieButton = await page.locator('button:has-text("Accept")').first();
-    if (await cookieButton.isVisible({ timeout: 2000 })) {
-      await cookieButton.click().catch(() => {});
-      log.info('Accepted cookies');
-    }
-  } catch {}
+  // 2) Cookie consent (best-effort)
+  await clickFirstVisible(page, [
+    'button:has-text("Accept")',
+    'button:has-text("Accept All")',
+    'button:has-text("Agree")',
+    '#onetrust-accept-btn-handler',
+    'button[aria-label*="accept" i]',
+  ], log, 3000).catch(() => {});
 
-  // === Search box (kept the same idea, slightly more forgiving) ===
-  // Your Apify selector: input[placeholder*="Search"]
-  // We add `i` (case-insensitive) and a couple of near-equivalents but still prefer your original.
+  // 3) Find search input (same intent as your Apify code)
   const searchSelector = [
     'input[placeholder*="Search" i]',
     'input[type="search"]',
@@ -31,65 +66,92 @@ router.addHandler('search', async ({ request, page, log }) => {
   ].join(', ');
 
   try {
-    await page.waitForSelector(searchSelector, { timeout: 20000 });
+    await page.waitForSelector(searchSelector, { timeout: 25000 });
   } catch {
-    await Dataset.pushData({ company, error: 'Search input not found' });
+    await page.screenshot({ path: path.join(shotsDir, `${company}-no-search.png`), fullPage: true }).catch(() => {});
+    await Dataset.pushData({ company, error: 'SEARCH_INPUT_NOT_FOUND', pageUrl: page.url() });
     return;
   }
 
   const searchInput = page.locator(searchSelector).first();
   await searchInput.click().catch(() => {});
   await searchInput.fill(company, { timeout: 15000 }).catch(() => {});
+  // Some sites require a short pause before submit
+  await page.waitForTimeout(500);
   await page.keyboard.press('Enter');
 
-  // Your Apify code waits for “View Detail”. We’ll keep that, with a small fallback.
-  try {
-    await page.waitForSelector('text="View Detail"', { timeout: 25000 });
-  } catch {
-    // small grace scroll to trigger lazy content before giving up
-    await page.mouse.wheel(0, 1000).catch(() => {});
-    await page.waitForTimeout(1500);
-    try {
-      await page.waitForSelector('text="View Detail"', { timeout: 8000 });
-    } catch {
-      await Dataset.pushData({ company, error: 'View Detail button not found' });
-      return;
-    }
+  // 4) Wait for results; gently scroll to trigger lazy rendering
+  await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => {});
+  for (let i = 0; i < 3; i++) {
+    await page.waitForTimeout(1200);
+    await page.mouse.wheel(0, 800).catch(() => {});
   }
 
-  const firstView = page.locator('text="View Detail"').first();
+  // 5) Diagnostics: list visible buttons/links that contain “detail” or “view”
+  const candidatesText = await page.evaluate(() => {
+    const els = Array.from(document.querySelectorAll('a, button'));
+    return els
+      .map(e => (e.innerText || '').trim())
+      .filter(t => /detail|view|open|more/i.test(t))
+      .slice(0, 20);
+  }).catch(() => []);
+  log.info(`🔎 Result action texts (top 20): ${JSON.stringify(candidatesText)}`);
 
-  // Handle possible new tab/popup like you did
-  let detailPage = page;
+  // 6) Click into the first result — broadened beyond "View Detail"
+  const detailSelectors = [
+    // Exact/close matches
+    'a:has-text("View Detail")',
+    'button:has-text("View Detail")',
+    'a:has-text("View Details")',
+    'button:has-text("View Details")',
+    // Generic result cards that often contain company name
+    `a:has-text("${company}")`,
+    `a[title*="${company}" i]`,
+    'a[href*="/product"]',
+    'a[href*="/company"]',
+    'a[href*="/drug"]',
+    // last resort: first anchor inside main/results area
+    'main a',
+    '[role="main"] a',
+  ];
+
+  const foundSel = await waitForAny(page, detailSelectors, 25000);
+  if (!foundSel) {
+    await page.screenshot({ path: path.join(shotsDir, `${company}-no-detail.png`), fullPage: true }).catch(() => {});
+    await Dataset.pushData({
+      company,
+      error: 'DETAIL_ENTRY_NOT_FOUND',
+      hints: candidatesText,
+      pageUrl: page.url(),
+    });
+    return;
+  }
+
+  // Try click; handle new tab/popups
   const context = page.context();
-  let newPagePromise;
-  try {
-    newPagePromise = context.waitForEvent('page', { timeout: 5000 });
-  } catch {}
-  await Promise.allSettled([
-    firstView.click().catch(() => {}),
-    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null),
-  ]);
-  try {
-    const maybePopup = newPagePromise ? await newPagePromise.catch(() => null) : null;
-    if (maybePopup) {
-      detailPage = maybePopup;
-      await detailPage.waitForLoadState('domcontentloaded', { timeout: 20000 });
-    }
-  } catch {}
+  const newPagePromise = context.waitForEvent('page').catch(() => null);
 
-  // Try to click “Pipeline” tab (kept from your code)
+  await Promise.allSettled([
+    page.locator(foundSel).first().click({ timeout: 12000 }),
+    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null),
+  ]);
+  const maybePopup = await newPagePromise;
+  const detailPage = maybePopup || page;
+
+  await detailPage.waitForLoadState('domcontentloaded', { timeout: 25000 }).catch(() => {});
+  await detailPage.waitForLoadState('networkidle', { timeout: 25000 }).catch(() => {});
+  await detailPage.waitForTimeout(1000);
+
+  // Try Pipeline tab
   try {
     const pipelineTab =
       detailPage.getByRole?.('tab', { name: /pipeline/i }) ??
       detailPage.locator('//*[contains(@class,"tab") and contains(.,"Pipeline")]');
-    await pipelineTab.first().click({ timeout: 8000 });
+    await pipelineTab.first().click({ timeout: 8000 }).catch(() => {});
     await detailPage.waitForTimeout(800);
   } catch {}
 
-  // --- Your snapshot/table extraction logic below is kept intact (with tiny safety tweaks) ---
-
-  // Try primary UI snapshot first (your approach)
+  // Snapshot pass
   let pipelineSnapshot = null;
   for (let i = 0; i < 5; i++) {
     pipelineSnapshot = await detailPage.evaluate(() => {
@@ -106,27 +168,23 @@ router.addHandler('search', async ({ request, page, log }) => {
         return snapshot;
       }
       return null;
-    });
+    }).catch(() => null);
 
     if (pipelineSnapshot && Object.values(pipelineSnapshot).some((v) => v != null)) break;
     await detailPage.evaluate(() => window.scrollBy(0, window.innerHeight)).catch(() => {});
     await detailPage.waitForTimeout(500);
   }
 
-  // If snapshot found, return it (raw; your Make mapping can stay the same)
   if (pipelineSnapshot && Object.values(pipelineSnapshot).some((v) => v != null)) {
-    await Dataset.pushData({
-      company,
-      pipelineSnapshot,
-    });
-    log.info(`Finished processing ${company} (snapshot extracted)`);
+    await Dataset.pushData({ company, pipelineSnapshot, detailUrl: detailPage.url() });
     return;
   }
 
-  // Fallback: pick a table that contains the expected keywords (your table approach)
+  // Table fallback
+  let pipelineTable = null;
   try {
     await detailPage.waitForSelector('table', { timeout: 15000 });
-    const pipelineTable = await detailPage.evaluate(() => {
+    pipelineTable = await detailPage.evaluate(() => {
       const keywordPatterns = [
         /discovery/i, /preclinical/i, /ind\s*application/i, /ind\s*approval/i,
         /phase\s*1/i, /phase\s*2/i, /phase\s*3/i, /approved/i, /other/i,
@@ -139,32 +197,29 @@ router.addHandler('search', async ({ request, page, log }) => {
         const text = table.innerText.toLowerCase();
         if (!keywordPatterns.some((re) => re.test(text))) continue;
         const rows = table.querySelectorAll('tbody tr');
-        const rowCount = rows.length;
-        if (rowCount > maxRows) {
-          maxRows = rowCount;
+        if (rows.length > maxRows) {
+          maxRows = rows.length;
           selectedTable = table;
         }
       }
       if (!selectedTable) return null;
-      const rows = Array.from(selectedTable.querySelectorAll('tbody tr')).map((row) =>
+      return Array.from(selectedTable.querySelectorAll('tbody tr')).map((row) =>
         Array.from(row.querySelectorAll('th, td')).map((cell) => cell.innerText.trim())
       );
-      return rows;
     });
-
-    if (pipelineTable && pipelineTable.length > 0) {
-      await Dataset.pushData({
-        company,
-        pipeline: pipelineTable,
-      });
-      log.info(`Finished processing ${company} (table extracted)`);
-      return;
-    }
   } catch {}
 
+  if (pipelineTable && pipelineTable.length > 0) {
+    await Dataset.pushData({ company, pipeline: pipelineTable, detailUrl: detailPage.url() });
+    return;
+  }
+
+  // Final screenshot on miss
+  await detailPage.screenshot({ path: path.join(shotsDir, `${company}-no-pipeline.png`), fullPage: true }).catch(() => {});
   await Dataset.pushData({
     company,
-    error: 'Pipeline snapshot not found',
+    error: 'PIPELINE_NOT_FOUND',
+    detailUrl: detailPage.url(),
   });
-  log.info(`Finished processing ${company} (snapshot not found)`);
 });
+
