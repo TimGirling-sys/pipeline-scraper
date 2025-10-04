@@ -1,3 +1,4 @@
+// routes.js — click by company name after search + stronger diagnostics
 import { createPlaywrightRouter, Dataset } from 'crawlee';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -16,7 +17,7 @@ async function clickFirstVisible(page, selectorList, log, timeoutPerSel = 8000) 
     try {
       await loc.waitFor({ timeout: timeoutPerSel });
       if (await loc.isVisible().catch(() => false)) {
-        log.info(`👉 Clicking selector: ${sel}`);
+        log.info(`👉 Clicking: ${sel}`);
         await loc.click({ timeout: timeoutPerSel }).catch(() => {});
         return true;
       }
@@ -39,10 +40,10 @@ async function waitForAny(page, selectors, timeoutMs) {
 
 router.addHandler('search', async ({ request, page, log }) => {
   const { company } = request.userData;
-  log.info(`Processing company: ${company}`, { url: request.url });
-
   const shotsDir = path.join(process.cwd(), 'screenshots');
   ensureDir(shotsDir);
+
+  log.info(`Processing company: ${company}`, { url: request.url });
 
   // 1) Load & settle
   await page.goto(request.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -57,7 +58,7 @@ router.addHandler('search', async ({ request, page, log }) => {
     'button[aria-label*="accept" i]',
   ], log, 3000).catch(() => {});
 
-  // 3) Find search input (same intent as your Apify code)
+  // 3) Find search input (your original intent + close variants)
   const searchSelector = [
     'input[placeholder*="Search" i]',
     'input[type="search"]',
@@ -76,84 +77,111 @@ router.addHandler('search', async ({ request, page, log }) => {
   const searchInput = page.locator(searchSelector).first();
   await searchInput.click().catch(() => {});
   await searchInput.fill(company, { timeout: 15000 }).catch(() => {});
-  // Some sites require a short pause before submit
   await page.waitForTimeout(500);
   await page.keyboard.press('Enter');
 
-  // 4) Wait for results; gently scroll to trigger lazy rendering
+  // 4) Wait for results; let SPA render; gently scroll to wake lazy loaders
   await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => {});
-  for (let i = 0; i < 3; i++) {
-    await page.waitForTimeout(1200);
-    await page.mouse.wheel(0, 800).catch(() => {});
+  for (let i = 0; i < 4; i++) {
+    await page.waitForTimeout(900);
+    await page.mouse.wheel(0, 900).catch(() => {});
   }
 
-  // 5) Diagnostics: list visible buttons/links that contain “detail” or “view”
-  const candidatesText = await page.evaluate(() => {
-    const els = Array.from(document.querySelectorAll('a, button'));
-    return els
-      .map(e => (e.innerText || '').trim())
-      .filter(t => /detail|view|open|more/i.test(t))
-      .slice(0, 20);
-  }).catch(() => []);
-  log.info(`🔎 Result action texts (top 20): ${JSON.stringify(candidatesText)}`);
+  // 5) Prefer clicking a link that contains the company name (case-insensitive)
+  //    This avoids relying on “View Details” marketing cards.
+  const companyNameLower = company.toLowerCase();
+  const linkSelector = 'a, [role="link"], button';
 
-  // 6) Click into the first result — broadened beyond "View Detail"
-  const detailSelectors = [
-    // Exact/close matches
-    'a:has-text("View Detail")',
-    'button:has-text("View Detail")',
-    'a:has-text("View Details")',
-    'button:has-text("View Details")',
-    // Generic result cards that often contain company name
-    `a:has-text("${company}")`,
-    `a[title*="${company}" i]`,
-    'a[href*="/product"]',
-    'a[href*="/company"]',
-    'a[href*="/drug"]',
-    // last resort: first anchor inside main/results area
-    'main a',
-    '[role="main"] a',
-  ];
+  // collect candidate links/buttons that contain the company name
+  const candidates = await page.evaluate((sel, nameLc) => {
+    const els = Array.from(document.querySelectorAll(sel));
+    const items = [];
+    for (const e of els) {
+      const text = (e.innerText || '').trim();
+      if (!text) continue;
+      if (text.toLowerCase().includes(nameLc)) {
+        const href = e.getAttribute('href') || '';
+        items.push({ text, href });
+      }
+    }
+    return items.slice(0, 20);
+  }, linkSelector, companyNameLower).catch(() => []);
 
-  const foundSel = await waitForAny(page, detailSelectors, 25000);
+  log.info(`🔎 Company-matching links/buttons (top 20): ${JSON.stringify(candidates)}`);
+
+  // Build dynamic selectors for exact text hits first, then partials
+  const dynamicSelectors = [];
+  // exact text hits first (case-sensitive selector in Playwright; we’ll add a couple of forms)
+  dynamicSelectors.push(`a:has-text("${company}")`, `[role="link"]:has-text("${company}")`, `button:has-text("${company}")`);
+  // looser partials
+  dynamicSelectors.push(`a:has-text("${company.split(' ')[0]}")`);
+  // generic likely areas
+  dynamicSelectors.push('main a', '[role="main"] a');
+
+  const foundSel = await waitForAny(page, dynamicSelectors, 25000);
   if (!foundSel) {
-    await page.screenshot({ path: path.join(shotsDir, `${company}-no-detail.png`), fullPage: true }).catch(() => {});
-    await Dataset.pushData({
-      company,
-      error: 'DETAIL_ENTRY_NOT_FOUND',
-      hints: candidatesText,
-      pageUrl: page.url(),
-    });
-    return;
+    // As a last resort, click the first candidate we saw via JS (by text match)
+    if (candidates.length > 0) {
+      const firstText = candidates[0].text;
+      log.info(`⚠️ Using JS-found candidate: ${firstText}`);
+      try {
+        await page.locator(`a:has-text("${firstText}")`).first().click({ timeout: 12000 });
+      } catch {
+        // if the selector form fails, try a coarse query via evaluate
+        const clicked = await page.evaluate((txt) => {
+          const els = Array.from(document.querySelectorAll('a, [role="link"], button'));
+          const el = els.find(e => (e.innerText || '').trim() === txt);
+          if (el) { el.click(); return true; }
+          return false;
+        }, firstText).catch(() => false);
+        if (!clicked) {
+          await page.screenshot({ path: path.join(shotsDir, `${company}-no-company-link.png`), fullPage: true }).catch(() => {});
+          await Dataset.pushData({
+            company,
+            error: 'COMPANY_LINK_NOT_FOUND',
+            hints: candidates,
+            pageUrl: page.url(),
+          });
+          return;
+        }
+      }
+    } else {
+      await page.screenshot({ path: path.join(shotsDir, `${company}-no-company-link.png`), fullPage: true }).catch(() => {});
+      await Dataset.pushData({
+        company,
+        error: 'COMPANY_LINK_NOT_FOUND',
+        hints: [],
+        pageUrl: page.url(),
+      });
+      return;
+    }
+  } else {
+    await page.locator(foundSel).first().click({ timeout: 12000 }).catch(() => {});
   }
 
-  // Try click; handle new tab/popups
+  // Handle potential new tab
   const context = page.context();
-  const newPagePromise = context.waitForEvent('page').catch(() => null);
-
-  await Promise.allSettled([
-    page.locator(foundSel).first().click({ timeout: 12000 }),
-    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null),
-  ]);
-  const maybePopup = await newPagePromise;
-  const detailPage = maybePopup || page;
+  const newPage = await context.waitForEvent('page', { timeout: 3000 }).catch(() => null);
+  const detailPage = newPage || page;
 
   await detailPage.waitForLoadState('domcontentloaded', { timeout: 25000 }).catch(() => {});
   await detailPage.waitForLoadState('networkidle', { timeout: 25000 }).catch(() => {});
   await detailPage.waitForTimeout(1000);
 
-  // Try Pipeline tab
+  // Optional: try to click "Pipeline" tab if present
   try {
     const pipelineTab =
       detailPage.getByRole?.('tab', { name: /pipeline/i }) ??
       detailPage.locator('//*[contains(@class,"tab") and contains(.,"Pipeline")]');
-    await pipelineTab.first().click({ timeout: 8000 }).catch(() => {});
-    await detailPage.waitForTimeout(800);
+    if (await pipelineTab.first().count()) {
+      await pipelineTab.first().click({ timeout: 8000 }).catch(() => {});
+      await detailPage.waitForTimeout(800);
+    }
   } catch {}
 
-  // Snapshot pass
+  // === Pipeline snapshot first (your original approach) ===
   let pipelineSnapshot = null;
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 6; i++) {
     pipelineSnapshot = await detailPage.evaluate(() => {
       const phaseItems = Array.from(document.querySelectorAll('div[class*="_phaseItem"]'));
       if (phaseItems.length > 0) {
@@ -172,7 +200,7 @@ router.addHandler('search', async ({ request, page, log }) => {
 
     if (pipelineSnapshot && Object.values(pipelineSnapshot).some((v) => v != null)) break;
     await detailPage.evaluate(() => window.scrollBy(0, window.innerHeight)).catch(() => {});
-    await detailPage.waitForTimeout(500);
+    await detailPage.waitForTimeout(600);
   }
 
   if (pipelineSnapshot && Object.values(pipelineSnapshot).some((v) => v != null)) {
@@ -180,7 +208,7 @@ router.addHandler('search', async ({ request, page, log }) => {
     return;
   }
 
-  // Table fallback
+  // === Table fallback ===
   let pipelineTable = null;
   try {
     await detailPage.waitForSelector('table', { timeout: 15000 });
@@ -222,4 +250,3 @@ router.addHandler('search', async ({ request, page, log }) => {
     detailUrl: detailPage.url(),
   });
 });
-
