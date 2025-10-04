@@ -1,0 +1,21 @@
+{
+  "name": "scraper-api",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "NODE_ENV=development node src/server.js",
+    "postinstall": "npx crawlee install-playwright-browsers"
+  },
+  "dependencies": {
+    "crawlee": "^3.13.8",
+    "playwright": "1.54.1",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "eslint": "^9.29.0",
+    "eslint-config-prettier": "^10.1.5",
+    "prettier": "^3.5.3"
+  }
+}
