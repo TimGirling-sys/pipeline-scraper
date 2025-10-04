@@ -1,4 +1,4 @@
-// routes.js — click by company name after search + stronger diagnostics
+// routes.js — click by company name after search + extract snapshot, tags, and top lists
 import { createPlaywrightRouter, Dataset } from 'crawlee';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -8,7 +8,6 @@ export const router = createPlaywrightRouter();
 function ensureDir(dir) {
   try { fs.mkdirSync(dir, { recursive: true }); } catch {}
 }
-
 async function clickFirstVisible(page, selectorList, log, timeoutPerSel = 8000) {
   for (const sel of selectorList) {
     const loc = page.locator(sel).first();
@@ -25,7 +24,6 @@ async function clickFirstVisible(page, selectorList, log, timeoutPerSel = 8000) 
   }
   return false;
 }
-
 async function waitForAny(page, selectors, timeoutMs) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -37,6 +35,114 @@ async function waitForAny(page, selectors, timeoutMs) {
   }
   return null;
 }
+
+// --------- DOM extraction helpers (run in page context) ----------
+function client_extractSnapshot() {
+  const snapshot = {};
+  const map = new Map();
+  // Look for typical phase items
+  const phaseItems = Array.from(document.querySelectorAll('div[class*="_phaseItem"], [data-phase], .phase-item'));
+  if (phaseItems.length) {
+    for (const item of phaseItems) {
+      const name =
+        item.querySelector('div[class*="_phaseName"], .phase-name, [data-phase-name]')?.textContent?.trim() ||
+        item.querySelector('*')?.textContent?.trim() || '';
+      const countText =
+        item.querySelector('div[class*="_phaseCount"], .phase-count, [data-phase-count]')?.textContent?.trim() ||
+        item.textContent || '';
+      if (!name) continue;
+      const m = String(countText).match(/(\d+)/);
+      const n = m ? Number(m[1]) : 0;
+      map.set(name, n);
+    }
+  }
+  // Also scan any obvious phase summary blocks
+  const labels = ['Discovery','Preclinical','IND Application','IND Approval','Phase 1','Phase 2','Phase 3','Approved','Other'];
+  const text = document.body.innerText;
+  for (const L of labels) {
+    if (!map.has(L)) {
+      const re = new RegExp(`${L}\\s*(\\d+)`, 'i');
+      const m = text.match(re);
+      if (m) map.set(L, Number(m[1]));
+    }
+  }
+  for (const [k, v] of map.entries()) snapshot[k] = v;
+  return Object.keys(snapshot).length ? snapshot : null;
+}
+
+function client_extractTagsIntro() {
+  // Try “Tags” section or chip-like elements
+  const chips = Array.from(document.querySelectorAll(
+    '[class*="tag"], [class*="chip"], .ant-tag, .ant-tag-green, .ant-tag-blue, .ant-tag-has-color'
+  ));
+  const tagTexts = chips.map(c => c.textContent.trim()).filter(Boolean);
+
+  // If there is a labeled “Tags” block, prefer chips inside it
+  let labeledTags = [];
+  const tagHeaders = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,strong,span'))
+    .filter(el => /tags?/i.test(el.textContent));
+  for (const hdr of tagHeaders) {
+    const section = hdr.closest('section,div,article') || hdr.parentElement;
+    if (!section) continue;
+    const localChips = Array.from(section.querySelectorAll('[class*="tag"], [class*="chip"], .ant-tag'))
+      .map(x => x.textContent.trim()).filter(Boolean);
+    if (localChips.length) { labeledTags = localChips; break; }
+  }
+  const finalTags = labeledTags.length ? labeledTags : tagTexts;
+  const uniq = Array.from(new Set(finalTags));
+  return uniq.length ? `Tags ${uniq.join(' ')}` : null;
+}
+
+function client_extractTopListByHeading(headingRegex) {
+  // Find a heading that matches and then extract list/table beneath it
+  const allHeadings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,strong,span'));
+  let section = null;
+  for (const h of allHeadings) {
+    const txt = (h.textContent || '').trim();
+    if (headingRegex.test(txt)) {
+      section = h.closest('section,div,article') || h.parentElement;
+      if (section) break;
+    }
+  }
+  if (!section) return [];
+
+  // Collect candidate rows/items within the section
+  let rows = Array.from(section.querySelectorAll('li, .item, .row, tr'))
+    .filter(el => /\d/.test(el.innerText)); // must contain a number
+
+  if (!rows.length) {
+    // fallback: pick direct children blocks that contain a number
+    rows = Array.from(section.querySelectorAll('div, a, span'))
+      .filter(el => el.children.length === 0 && /\d/.test(el.innerText))
+      .map(el => el.parentElement);
+  }
+
+  // Parse top 10 then we’ll cut to 5 at the caller
+  const items = [];
+  for (const r of rows.slice(0, 20)) {
+    const raw = (r.innerText || '').replace(/\s+/g, ' ').trim();
+    if (!raw) continue;
+    // Heuristic: last number is the count
+    const m = raw.match(/(.+?)\s*(\d+)(?:\D*)$/);
+    if (m) {
+      const name = m[1].trim();
+      const cnt = Number(m[2]);
+      if (name && Number.isFinite(cnt)) items.push({ name, count: cnt, raw });
+    }
+  }
+  // Prefer unique names, keep original order
+  const seen = new Set();
+  const deduped = [];
+  for (const it of items) {
+    const key = it.name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(it);
+  }
+  return deduped;
+}
+
+// ---------------------------------------------------------------
 
 router.addHandler('search', async ({ request, page, log }) => {
   const { company } = request.userData;
@@ -58,7 +164,7 @@ router.addHandler('search', async ({ request, page, log }) => {
     'button[aria-label*="accept" i]',
   ], log, 3000).catch(() => {});
 
-  // 3) Find search input (your original intent + close variants)
+  // 3) Find search input
   const searchSelector = [
     'input[placeholder*="Search" i]',
     'input[type="search"]',
@@ -80,21 +186,17 @@ router.addHandler('search', async ({ request, page, log }) => {
   await page.waitForTimeout(500);
   await page.keyboard.press('Enter');
 
-  // 4) Wait for results; let SPA render; gently scroll to wake lazy loaders
+  // 4) Wait for results; nudge lazy rendering
   await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => {});
   for (let i = 0; i < 4; i++) {
     await page.waitForTimeout(900);
     await page.mouse.wheel(0, 900).catch(() => {});
   }
 
-  // 5) Prefer clicking a link that contains the company name (case-insensitive)
-  //    This avoids relying on “View Details” marketing cards.
+  // 5) Prefer links that contain the company name
   const companyNameLower = company.toLowerCase();
-  const linkSelector = 'a, [role="link"], button';
-
-  // collect candidate links/buttons that contain the company name
-  const candidates = await page.evaluate((sel, nameLc) => {
-    const els = Array.from(document.querySelectorAll(sel));
+  const candidates = await page.evaluate((nameLc) => {
+    const els = Array.from(document.querySelectorAll('a, [role="link"], button'));
     const items = [];
     for (const e of els) {
       const text = (e.innerText || '').trim();
@@ -105,29 +207,23 @@ router.addHandler('search', async ({ request, page, log }) => {
       }
     }
     return items.slice(0, 20);
-  }, linkSelector, companyNameLower).catch(() => []);
+  }, companyNameLower).catch(() => []);
 
-  log.info(`🔎 Company-matching links/buttons (top 20): ${JSON.stringify(candidates)}`);
-
-  // Build dynamic selectors for exact text hits first, then partials
-  const dynamicSelectors = [];
-  // exact text hits first (case-sensitive selector in Playwright; we’ll add a couple of forms)
-  dynamicSelectors.push(`a:has-text("${company}")`, `[role="link"]:has-text("${company}")`, `button:has-text("${company}")`);
-  // looser partials
-  dynamicSelectors.push(`a:has-text("${company.split(' ')[0]}")`);
-  // generic likely areas
-  dynamicSelectors.push('main a', '[role="main"] a');
+  const dynamicSelectors = [
+    `a:has-text("${company}")`,
+    `[role="link"]:has-text("${company}")`,
+    `button:has-text("${company}")`,
+    `a:has-text("${company.split(' ')[0]}")`,
+    'main a', '[role="main"] a',
+  ];
 
   const foundSel = await waitForAny(page, dynamicSelectors, 25000);
   if (!foundSel) {
-    // As a last resort, click the first candidate we saw via JS (by text match)
     if (candidates.length > 0) {
       const firstText = candidates[0].text;
-      log.info(`⚠️ Using JS-found candidate: ${firstText}`);
       try {
         await page.locator(`a:has-text("${firstText}")`).first().click({ timeout: 12000 });
       } catch {
-        // if the selector form fails, try a coarse query via evaluate
         const clicked = await page.evaluate((txt) => {
           const els = Array.from(document.querySelectorAll('a, [role="link"], button'));
           const el = els.find(e => (e.innerText || '').trim() === txt);
@@ -136,23 +232,13 @@ router.addHandler('search', async ({ request, page, log }) => {
         }, firstText).catch(() => false);
         if (!clicked) {
           await page.screenshot({ path: path.join(shotsDir, `${company}-no-company-link.png`), fullPage: true }).catch(() => {});
-          await Dataset.pushData({
-            company,
-            error: 'COMPANY_LINK_NOT_FOUND',
-            hints: candidates,
-            pageUrl: page.url(),
-          });
+          await Dataset.pushData({ company, error: 'COMPANY_LINK_NOT_FOUND', hints: candidates, pageUrl: page.url() });
           return;
         }
       }
     } else {
       await page.screenshot({ path: path.join(shotsDir, `${company}-no-company-link.png`), fullPage: true }).catch(() => {});
-      await Dataset.pushData({
-        company,
-        error: 'COMPANY_LINK_NOT_FOUND',
-        hints: [],
-        pageUrl: page.url(),
-      });
+      await Dataset.pushData({ company, error: 'COMPANY_LINK_NOT_FOUND', hints: [], pageUrl: page.url() });
       return;
     }
   } else {
@@ -168,7 +254,7 @@ router.addHandler('search', async ({ request, page, log }) => {
   await detailPage.waitForLoadState('networkidle', { timeout: 25000 }).catch(() => {});
   await detailPage.waitForTimeout(1000);
 
-  // Optional: try to click "Pipeline" tab if present
+  // Optional: click "Pipeline" tab
   try {
     const pipelineTab =
       detailPage.getByRole?.('tab', { name: /pipeline/i }) ??
@@ -179,74 +265,115 @@ router.addHandler('search', async ({ request, page, log }) => {
     }
   } catch {}
 
-  // === Pipeline snapshot first (your original approach) ===
-  let pipelineSnapshot = null;
-  for (let i = 0; i < 6; i++) {
-    pipelineSnapshot = await detailPage.evaluate(() => {
-      const phaseItems = Array.from(document.querySelectorAll('div[class*="_phaseItem"]'));
-      if (phaseItems.length > 0) {
-        const snapshot = {};
-        phaseItems.forEach((item) => {
-          const nameEl = item.querySelector('div[class*="_phaseName"]');
-          const countEl = item.querySelector('div[class*="_phaseCount"]');
-          const name = nameEl && nameEl.textContent.trim();
-          const count = countEl && countEl.textContent.trim();
-          if (name && count) snapshot[name] = count;
-        });
-        return snapshot;
-      }
-      return null;
-    }).catch(() => null);
-
-    if (pipelineSnapshot && Object.values(pipelineSnapshot).some((v) => v != null)) break;
+  // Try a couple of scroll passes so dynamic widgets render
+  for (let i = 0; i < 4; i++) {
     await detailPage.evaluate(() => window.scrollBy(0, window.innerHeight)).catch(() => {});
     await detailPage.waitForTimeout(600);
   }
 
-  if (pipelineSnapshot && Object.values(pipelineSnapshot).some((v) => v != null)) {
-    await Dataset.pushData({ company, pipelineSnapshot, detailUrl: detailPage.url() });
-    return;
+  // === Extract snapshot (Discovery..Approved) ===
+  let pipelineSnapshot = null;
+  for (let i = 0; i < 6; i++) {
+    pipelineSnapshot = await detailPage.evaluate(client_extractSnapshot).catch(() => null);
+    if (pipelineSnapshot && Object.keys(pipelineSnapshot).length) break;
+    await detailPage.waitForTimeout(500);
   }
 
-  // === Table fallback ===
-  let pipelineTable = null;
-  try {
-    await detailPage.waitForSelector('table', { timeout: 15000 });
-    pipelineTable = await detailPage.evaluate(() => {
-      const keywordPatterns = [
-        /discovery/i, /preclinical/i, /ind\s*application/i, /ind\s*approval/i,
-        /phase\s*1/i, /phase\s*2/i, /phase\s*3/i, /approved/i, /other/i,
-        /disease\s+domain/i, /count/i,
-      ];
-      const tables = Array.from(document.querySelectorAll('table'));
-      let selectedTable = null;
-      let maxRows = 0;
-      for (const table of tables) {
-        const text = table.innerText.toLowerCase();
-        if (!keywordPatterns.some((re) => re.test(text))) continue;
-        const rows = table.querySelectorAll('tbody tr');
-        if (rows.length > maxRows) {
-          maxRows = rows.length;
-          selectedTable = table;
-        }
-      }
-      if (!selectedTable) return null;
-      return Array.from(selectedTable.querySelectorAll('tbody tr')).map((row) =>
-        Array.from(row.querySelectorAll('th, td')).map((cell) => cell.innerText.trim())
-      );
-    });
-  } catch {}
+  // === Extract Tags/Introduction (chips) ===
+  const introduction = await detailPage.evaluate(client_extractTagsIntro).catch(() => null);
 
-  if (pipelineTable && pipelineTable.length > 0) {
-    await Dataset.pushData({ company, pipeline: pipelineTable, detailUrl: detailPage.url() });
-    return;
-  }
+  // === Extract Top lists ===
+  const diseaseDomainItems = await detailPage
+    .evaluate(client_extractTopListByHeading, /disease\s*domain/i)
+    .catch(() => []);
+  const drugTypeItems = await detailPage
+    .evaluate(client_extractTopListByHeading, /drug\s*type/i)
+    .catch(() => []);
+  const targetItems = await detailPage
+    .evaluate(client_extractTopListByHeading, /\btargets?\b/i)
+    .catch(() => []);
 
-  // Final screenshot on miss
-  await detailPage.screenshot({ path: path.join(shotsDir, `${company}-no-pipeline.png`), fullPage: true }).catch(() => {});
-  await Dataset.pushData({
-    company,
-    error: 'PIPELINE_NOT_FOUND',
-    detailUrl: detailPage.url(),
+  // Keep top 5 each
+  const dd = diseaseDomainItems.slice(0, 5);
+  const dt = drugTypeItems.slice(0, 5);
+  const tg = targetItems.slice(0, 5);
+
+  // Build Apify-style payload keys
+  const result = { company, detailUrl: detailPage.url() };
+  if (pipelineSnapshot) result.pipelineSnapshot = pipelineSnapshot;
+  if (introduction) result.introduction = introduction;
+
+  dd.forEach((it, i) => {
+    result[`topDiseaseDomain_${i + 1}`] = it.name;
+    result[`topDiseaseDomainCount_${i + 1}`] = it.count;
   });
+  dt.forEach((it, i) => {
+    result[`topDrugType_${i + 1}`] = it.name;
+    result[`topDrugTypeCount_${i + 1}`] = it.count;
+  });
+  tg.forEach((it, i) => {
+    result[`topTarget_${i + 1}`] = it.name;
+    result[`topTargetCount_${i + 1}`] = it.count;
+  });
+
+  // If we still have nothing but company/url, fall back to the table we previously parsed
+  let pushed = false;
+  if (
+    result.pipelineSnapshot ||
+    result.introduction ||
+    dd.length || dt.length || tg.length
+  ) {
+    await Dataset.pushData(result);
+    pushed = true;
+  } else {
+    // Fallback: try to harvest any pipeline-like table as before
+    let pipelineTable = null;
+    try {
+      await detailPage.waitForSelector('table', { timeout: 15000 });
+      pipelineTable = await detailPage.evaluate(() => {
+        const keywordPatterns = [
+          /discovery/i, /preclinical/i, /ind\s*application/i, /ind\s*approval/i,
+          /phase\s*1/i, /phase\s*2/i, /phase\s*3/i, /approved/i, /other/i,
+          /disease\s+domain/i, /count/i,
+        ];
+        const tables = Array.from(document.querySelectorAll('table'));
+        let selectedTable = null;
+        let maxRows = 0;
+        for (const table of tables) {
+          const text = table.innerText.toLowerCase();
+          if (!keywordPatterns.some((re) => re.test(text))) continue;
+          const rows = table.querySelectorAll('tbody tr');
+          if (rows.length > maxRows) {
+            maxRows = rows.length;
+            selectedTable = table;
+          }
+        }
+        if (!selectedTable) return null;
+        return Array.from(selectedTable.querySelectorAll('tbody tr')).map((row) =>
+          Array.from(row.querySelectorAll('th, td')).map((cell) => cell.innerText.trim())
+        );
+      });
+    } catch {}
+
+    if (pipelineTable && pipelineTable.length > 0) {
+      // normalize to key/value like your Apify shape expects elsewhere
+      const pipelineKV = {};
+      for (const row of pipelineTable) {
+        const firstCell = row?.[0];
+        if (!firstCell) continue;
+        const parts = String(firstCell).split('\n').map(s => s.trim()).filter(Boolean);
+        const key = parts.shift();
+        if (!key) continue;
+        const value = parts.join(' ').replace(/\[\+(\d+)\]/g, '(+$1)');
+        pipelineKV[key] = value || null;
+      }
+      await Dataset.pushData({ company, pipeline: pipelineKV, rawTable: pipelineTable, detailUrl: detailPage.url() });
+      pushed = true;
+    }
+  }
+
+  if (!pushed) {
+    await detailPage.screenshot({ path: path.join(shotsDir, `${company}-no-pipeline.png`), fullPage: true }).catch(() => {});
+    await Dataset.pushData({ company, error: 'PIPELINE_NOT_FOUND', detailUrl: detailPage.url() });
+  }
 });
