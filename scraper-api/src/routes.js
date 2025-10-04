@@ -1,4 +1,4 @@
-// routes.js — rock-solid search submission + company click + extraction
+// routes.js — rock-solid search submission + company click + extraction (JS-only)
 import { createPlaywrightRouter, Dataset } from 'crawlee';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -8,6 +8,7 @@ export const router = createPlaywrightRouter();
 function ensureDir(dir) {
   try { fs.mkdirSync(dir, { recursive: true }); } catch {}
 }
+
 async function clickFirstVisible(page, selectorList, log, timeoutPerSel = 8000) {
   for (const sel of selectorList) {
     const loc = page.locator(sel).first();
@@ -24,6 +25,7 @@ async function clickFirstVisible(page, selectorList, log, timeoutPerSel = 8000) 
   }
   return false;
 }
+
 async function waitForAny(page, selectors, timeoutMs) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -157,7 +159,6 @@ router.addHandler('search', async ({ request, page, log }) => {
     'input[type="search"]',
     'input[aria-label*="Search" i]',
     'input[name*="search" i]',
-    // common site-specific fallbacks:
     'header input',
     '.ant-input[type="text"]',
   ];
@@ -173,22 +174,17 @@ router.addHandler('search', async ({ request, page, log }) => {
   await searchInput.fill(company, { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(400);
 
-  // 4) Submit search robustly (4 strategies)
+  // 4) Submit search (multiple strategies)
   const urlBefore = page.url();
-  // a) Enter key (twice, some SPAs need two)
   await page.keyboard.press('Enter').catch(() => {});
   await page.waitForTimeout(400);
   await page.keyboard.press('Enter').catch(() => {});
-
-  // b) Click a nearby "Search" button if present
-  const clickedSearchBtn = await clickFirstVisible(page, [
+  await clickFirstVisible(page, [
     'button:has-text("Search")',
     'button[aria-label*="search" i]',
     'form button[type="submit"]',
     '.ant-input-search-button',
   ], log, 3000);
-
-  // c) Submit the closest form
   try {
     await page.evaluate((sel) => {
       const el = document.querySelector(sel);
@@ -197,26 +193,22 @@ router.addHandler('search', async ({ request, page, log }) => {
     }, foundSearchSel);
   } catch {}
 
-  // d) If still on homepage after 3s, navigate to the public results route via JS
   await page.waitForTimeout(3000);
   const stillHomepage = page.url() === urlBefore;
   if (stillHomepage) {
     log.info('⚠️ Still on homepage after submit attempts — forcing navigation to results route.');
     try {
-      // Known public results route used by SPA; keyword param works on free tier.
       await page.goto(`https://synapse.patsnap.com/homepage/search?keyword=${encodeURIComponent(company)}`, {
         waitUntil: 'domcontentloaded', timeout: 60000,
       });
     } catch {}
   }
 
-  // 5) Wait for results page or results container
-  //    (URL often contains /homepage/search and a results list renders)
-  const onResults = () => /\/search/i.test(page.url()) || /results?/i.test(document.body.innerText);
+  // 5) Wait for results
+  const onResults = () => /\/search/i.test(window.location.href) || /results?/i.test(document.body.innerText);
   try {
     await page.waitForFunction(onResults, { timeout: 15000 });
   } catch {
-    // Wake the SPA and try again
     for (let i = 0; i < 5; i++) {
       await page.mouse.wheel(0, 800).catch(() => {});
       await page.waitForTimeout(500);
@@ -239,12 +231,9 @@ router.addHandler('search', async ({ request, page, log }) => {
   // 7) Try to click a result that contains the company name
   const companyLc = company.toLowerCase();
   const resultSelectors = [
-    // Typical result title areas
     `a:has-text("${company}")`,
     `[role="link"]:has-text("${company}")`,
-    // partials for multi-word names
     `a:has-text("${company.split(' ')[0]}")`,
-    // cards & list items commonly used in Ant Design or custom grids
     '.ant-list-item a',
     '.ant-card a',
     '.ant-list-item',
@@ -252,7 +241,6 @@ router.addHandler('search', async ({ request, page, log }) => {
     'main a',
   ];
 
-  // prefer an exact text match if it exists in the clickables list
   let clickedCompany = false;
   const exactInClickables = clickables.find(t => t.toLowerCase() === companyLc);
   if (exactInClickables) {
@@ -265,8 +253,8 @@ router.addHandler('search', async ({ request, page, log }) => {
   if (!clickedCompany) {
     const foundSel = await waitForAny(page, resultSelectors, 20000);
     if (foundSel) {
-      // Filter to only nodes that include the company text
-      const loc = page.locator(foundSel).filter({ hasText: new RegExp(company.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }).first();
+      const safe = company.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const loc = page.locator(foundSel).filter({ hasText: new RegExp(safe, 'i') }).first();
       if (await loc.count().catch(() => 0)) {
         log.info(`🧭 Clicking company match in results via: ${foundSel}`);
         await loc.click({ timeout: 10000 }).catch(() => {});
@@ -275,12 +263,19 @@ router.addHandler('search', async ({ request, page, log }) => {
     }
   }
 
-  // Fallback: try to click any clickable that includes the company (JS)
+  // Fallback: try to click any clickable that includes the company (pure JS, no TS cast)
   if (!clickedCompany) {
     const didClick = await page.evaluate((nameLc) => {
       const els = Array.from(document.querySelectorAll('a, [role="link"], button'));
       const el = els.find(e => (e.innerText || '').toLowerCase().includes(nameLc));
-      if (el) { (el as HTMLElement).click(); return true; }
+      if (el) {
+        if (typeof el.click === 'function') {
+          el.click();
+        } else {
+          el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        }
+        return true;
+      }
       return false;
     }, companyLc).catch(() => false);
     clickedCompany = !!didClick;
