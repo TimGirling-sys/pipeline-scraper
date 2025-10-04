@@ -14,31 +14,36 @@ export async function runScrape({ companies = [], maxConcurrency = 5, proxyUrl =
   const crawler = new PlaywrightCrawler({
     proxyConfiguration,
     requestHandler: router,
-    headless: true,
-    requestHandlerTimeoutSecs: 90,
-    navigationTimeoutSecs: 60,
+    headless: true, // set to false to watch browser locally
+    requestHandlerTimeoutSecs: 180, // was 90
+    navigationTimeoutSecs: 90,      // was 60
     maxConcurrency,
     minConcurrency: Math.min(2, maxConcurrency),
     preNavigationHooks: [
       async ({ page }) => {
+        await page.setViewportSize({ width: 1366, height: 768 }).catch(() => {});
+        // Only skip heavy media, keep fonts/images so UI renders correctly
         await page.route('**/*', (route) => {
-          const req = route.request();
-          const type = req.resourceType();
-          if (['image', 'font', 'media'].includes(type)) return route.abort();
-          const url = req.url();
-          if (/\b(googletagmanager|google-analytics|segment|hotjar|mixpanel)\b/i.test(url)) {
-            return route.abort();
-          }
+          const type = route.request().resourceType();
+          if (type === 'media') return route.abort();
           return route.continue();
         });
       },
     ],
     launchContext: {
-      launchOptions: { args: ['--disable-gpu', '--no-sandbox'] },
+      launchOptions: {
+        args: [
+          '--disable-gpu',
+          '--no-sandbox',
+          '--disable-dev-shm-usage',
+          '--window-size=1366,768',
+        ],
+      },
     },
   });
 
   await crawler.run(startRequests);
+
   const data = await Dataset.getData();
   return data;
 }
